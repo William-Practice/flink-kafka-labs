@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # 编译校验：Flink 依赖全部 provided，CI 只验证业务代码能编译过
+  # ---------------------------------------------------------------
+  build:
+    name: Maven 编译
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 11（Flink 1.17 支持 Java 8/11）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: maven
+
+      - name: mvn compile
+        run: mvn -B -ntp compile
+
+      - name: 校验编译产物（每个实验类都生成了 class）
+        run: |
+          set -euo pipefail
+          expect="L36ParallelismDemo L37KafkaStateCheckpoint L39WatermarkTrigger L39bWatermarkKafka"
+          fail=0
+          for c in $expect; do
+            if [ -f "target/classes/com/example/$c.class" ]; then
+              echo "OK   $c.class"
+            else
+              echo "MISS $c.class"; fail=1
+            fi
+          done
+          exit $fail
+
+  # ---------------------------------------------------------------
+  # 结构 / 脚本检查
+  # ---------------------------------------------------------------
+  structure:
+    name: 仓库结构检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验必需文件
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in README.md LICENSE .gitignore pom.xml docs/flink-lab-notes.md \
+                   sql/l41-l46-flink-sql.sql sql/l45-mysql-sink.sql; do
+            if [ -f "$f" ]; then echo "OK   $f"; else echo "MISS $f"; fail=1; fi
+          done
+          exit $fail
+
+      - name: 校验源码目录里的实验类齐全
+        run: |
+          set -euo pipefail
+          fail=0
+          for c in L36ParallelismDemo L37KafkaStateCheckpoint L39WatermarkTrigger L39bWatermarkKafka; do
+            f="src/main/java/com/example/$c.java"
+            if [ -f "$f" ]; then echo "OK   $f"; else echo "MISS $f"; fail=1; fi
+          done
+          exit $fail
+
+      - name: 校验 SQL 脚本可读且非空
+        run: |
+          set -euo pipefail
+          for f in sql/*.sql; do
+            lines=$(grep -cv '^\s*$' "$f" || true)
+            echo "$f  非空行 $lines"
+            [ "$lines" -gt 5 ] || { echo "!! $f 内容过少"; exit 1; }
+          done
+
+  # ---------------------------------------------------------------
+  # 敏感信息扫描（同姊妹仓库 taxi-realtime-warehouse 的做法）
+  # ---------------------------------------------------------------
+  secret-scan:
+    name: 敏感信息扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 扫描真实凭据特征
+        run: |
+          set -euo pipefail
+          patterns=(
+            'ghp_[A-Za-z0-9]{20,}'
+            'gho_[A-Za-z0-9]{20,}'
+            'ghs_[A-Za-z0-9]{20,}'
+            'github_pat_[A-Za-z0-9_]{20,}'
+            'sk-[A-Za-z0-9]{20,}'
+            'AKIA[0-9A-Z]{16}'
+            'xox[baprs]-[A-Za-z0-9-]{10,}'
+            'AIza[A-Za-z0-9_-]{35}'
+            '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          )
+          hit=0
+          for p in "${patterns[@]}"; do
+            if grep -rInE "$p" --exclude-dir=.git . ; then
+              echo "!! 命中可疑凭据模式: $p"; hit=1
+            fi
+          done
+          [ "$hit" -eq 0 ] || exit 1
+          echo "未发现真实凭据特征"
+
+      - name: 确认没有提交敏感文件
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.env|*.env.local|*.pem|*.key|id_rsa*|*.p12|*.jks)
+                echo "!! 不该提交: $f"; fail=1 ;;
+            esac
+          done < <(git ls-files)
+          exit $fail
